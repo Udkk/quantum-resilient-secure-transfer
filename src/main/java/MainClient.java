@@ -5,6 +5,7 @@ import javax.crypto.spec.IvParameterSpec;
 import java.io.*;
 import java.net.Socket;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.KeyFactory;
 import java.security.KeyPair;
@@ -24,9 +25,23 @@ public class MainClient {
         try {
             CryptoProvider.register();
 
+            if (args.length == 0) {
+                System.out.println("Usage: java MainClient <file_path>");
+                return;
+            }
+
             String host = "localhost";
             int port = 5000;
-            String inputFile = "input.txt";
+
+            Path filePath = Paths.get(args[0]);
+
+            if (!Files.exists(filePath)) {
+                System.out.println("File not found: " + filePath);
+                return;
+            }
+
+            String fileName = filePath.getFileName().toString();
+            byte[] fileBytes = Files.readAllBytes(filePath);
 
             System.out.println("Connecting to server...");
 
@@ -42,20 +57,17 @@ public class MainClient {
                 // ==============================
 
                 int serverECDHPubLen = dis.readInt();
-                byte[] serverECDHPubBytes =
-                        new byte[serverECDHPubLen];
+                byte[] serverECDHPubBytes = new byte[serverECDHPubLen];
                 dis.readFully(serverECDHPubBytes);
 
-                KeyFactory kf =
-                        KeyFactory.getInstance("EC");
+                KeyFactory kf = KeyFactory.getInstance("EC");
 
                 PublicKey serverECDHPublic =
                         kf.generatePublic(
                                 new X509EncodedKeySpec(serverECDHPubBytes));
 
                 int serverKyberPubLen = dis.readInt();
-                byte[] serverKyberPubBytes =
-                        new byte[serverKyberPubLen];
+                byte[] serverKyberPubBytes = new byte[serverKyberPubLen];
                 dis.readFully(serverKyberPubBytes);
 
                 KyberPublicKeyParameters serverKyberPublic =
@@ -128,27 +140,16 @@ public class MainClient {
                         dilithiumPublic.getEncoded();
 
                 // ==============================
-                // 6. READ FILE
-                // ==============================
-
-                byte[] fileBytes =
-                        Files.readAllBytes(Paths.get(inputFile));
-
-                String fileName =
-                        new File(inputFile).getName();
-
-                // ==============================
-                // 7. GENERATE IV
+                // 6. GENERATE IV
                 // ==============================
 
                 IvParameterSpec iv =
                         AESUtil.generateIV();
 
-                byte[] ivBytes =
-                        iv.getIV();
+                byte[] ivBytes = iv.getIV();
 
                 // ==============================
-                // 8. ENCRYPT FILE
+                // 7. ENCRYPT FILE
                 // ==============================
 
                 byte[] encryptedFile =
@@ -159,18 +160,15 @@ public class MainClient {
                         );
 
                 // ==============================
-                // 9. HASH ENCRYPTED FILE
+                // 8. HASH ENCRYPTED FILE
                 // ==============================
 
                 byte[] encryptedHash =
                         HashUtil.sha256(encryptedFile);
 
                 // ==============================
-                // 10. BUILD SIGNED DATA
+                // 9. BUILD SIGNED METADATA
                 // ==============================
-
-                byte[] plaintextHash =
-                        HashUtil.sha256(fileBytes);
 
                 ByteArrayOutputStream metaStream =
                         new ByteArrayOutputStream();
@@ -179,14 +177,10 @@ public class MainClient {
 
                 metaOut.writeUTF(fileName);
                 metaOut.writeLong(encryptedFile.length);
-                metaOut.write(plaintextHash);
+                metaOut.write(encryptedHash);
 
                 byte[] dataToSign =
                         metaStream.toByteArray();
-
-                // ==============================
-                // 11. SIGN WITH DILITHIUM
-                // ==============================
 
                 DilithiumSigner signer =
                         new DilithiumSigner();
@@ -197,30 +191,24 @@ public class MainClient {
                         signer.generateSignature(dataToSign);
 
                 // ==============================
-                // 12. SEND DILITHIUM PUBLIC KEY
+                // 10. SEND EVERYTHING
                 // ==============================
 
+                // Send Dilithium public key
                 dos.writeInt(dilithiumPubBytes.length);
                 dos.write(dilithiumPubBytes);
 
-                // ==============================
-                // 13. SEND SIGNATURE
-                // ==============================
-
+                // Send signature
                 dos.writeInt(signature.length);
                 dos.write(signature);
 
-                // ==============================
-                // 14. SEND FILE METADATA
-                // ==============================
-
+                // Send file metadata
                 dos.writeUTF(fileName);
 
                 dos.writeInt(ivBytes.length);
                 dos.write(ivBytes);
 
                 dos.writeLong(encryptedFile.length);
-
                 dos.write(encryptedFile);
 
                 dos.writeInt(encryptedHash.length);

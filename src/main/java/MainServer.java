@@ -12,9 +12,7 @@ import java.security.spec.X509EncodedKeySpec;
 import java.util.Arrays;
 
 import org.bouncycastle.crypto.AsymmetricCipherKeyPair;
-import org.bouncycastle.pqc.crypto.crystals.kyber.KyberPrivateKeyParameters;
-import org.bouncycastle.pqc.crypto.crystals.kyber.KyberPublicKeyParameters;
-
+import org.bouncycastle.pqc.crypto.crystals.kyber.*;
 import org.bouncycastle.pqc.crypto.crystals.dilithium.*;
 
 public class MainServer {
@@ -56,16 +54,13 @@ public class MainServer {
                     // 1. SEND SERVER PUBLIC KEYS
                     // =========================
 
-                    byte[] serverECDHPubBytes =
-                            serverECDH.getPublic().getEncoded();
+                    byte[] serverECDHPubBytes = serverECDH.getPublic().getEncoded();
                     dos.writeInt(serverECDHPubBytes.length);
                     dos.write(serverECDHPubBytes);
 
-                    byte[] serverKyberPubBytes =
-                            serverKyberPublic.getEncoded();
+                    byte[] serverKyberPubBytes = serverKyberPublic.getEncoded();
                     dos.writeInt(serverKyberPubBytes.length);
                     dos.write(serverKyberPubBytes);
-
                     dos.flush();
 
                     // =========================
@@ -78,8 +73,7 @@ public class MainServer {
 
                     KeyFactory kf = KeyFactory.getInstance("EC");
                     PublicKey clientECDHPublic =
-                            kf.generatePublic(
-                                    new X509EncodedKeySpec(clientECDHPubBytes));
+                            kf.generatePublic(new X509EncodedKeySpec(clientECDHPubBytes));
 
                     byte[] serverECDHSecret =
                             ECDHKeyExchange.computeSharedSecret(
@@ -118,8 +112,7 @@ public class MainServer {
                     // =========================
 
                     int dilithiumPubLen = dis.readInt();
-                    byte[] dilithiumPubBytes =
-                            new byte[dilithiumPubLen];
+                    byte[] dilithiumPubBytes = new byte[dilithiumPubLen];
                     dis.readFully(dilithiumPubBytes);
 
                     DilithiumPublicKeyParameters clientDilithiumPublic =
@@ -148,84 +141,51 @@ public class MainServer {
                     dis.readFully(ivBytes);
                     IvParameterSpec iv = new IvParameterSpec(ivBytes);
 
-                    long fileSize = dis.readLong();
-                    System.out.println("Encrypted file size: " + fileSize);
+                    long encryptedSize = dis.readLong();
+                    System.out.println("Encrypted file size: " + encryptedSize);
 
                     // =========================
                     // 8. RECEIVE ENCRYPTED FILE
                     // =========================
 
-                    byte[] encryptedFile =
-                            new byte[(int) fileSize];
+                    byte[] encryptedFile = new byte[(int) encryptedSize];
                     dis.readFully(encryptedFile);
 
                     // =========================
-                    // 9. RECEIVE HASH (Encrypted Integrity)
+                    // 9. RECEIVE HASH
                     // =========================
 
                     int hashLen = dis.readInt();
                     byte[] receivedHash = new byte[hashLen];
                     dis.readFully(receivedHash);
 
-                    byte[] computedHash =
-                            HashUtil.sha256(encryptedFile);
+                    byte[] computedHash = HashUtil.sha256(encryptedFile);
 
                     if (!Arrays.equals(receivedHash, computedHash)) {
-                        System.out.println("ERROR: File hash mismatch!");
+                        System.out.println("❌ ERROR: Encrypted file hash mismatch!");
                         return;
                     }
 
                     System.out.println("Encrypted file hash verified!");
 
                     // =========================
-                    // 10. DECRYPT FILE
+                    // 10. VERIFY SIGNATURE (Before Decrypt)
                     // =========================
 
-                    byte[] decryptedFile =
-                            AESUtil.decrypt(
-                                    encryptedFile,
-                                    serverAESKey,
-                                    iv
-                            );
-
-                    String decryptedFilePath =
-                            "received_decrypted_" + fileName;
-
-                    try (FileOutputStream fos =
-                                 new FileOutputStream(decryptedFilePath)) {
-                        fos.write(decryptedFile);
-                    }
-
-                    System.out.println("File decrypted successfully!");
-
-                    // =========================
-                    // 11. VERIFY DILITHIUM SIGNATURE
-                    // =========================
-
-                    byte[] plaintextHash =
-                            HashUtil.sha256(decryptedFile);
-
-                    ByteArrayOutputStream metaStream =
-                            new ByteArrayOutputStream();
-                    DataOutputStream metaOut =
-                            new DataOutputStream(metaStream);
+                    ByteArrayOutputStream metaStream = new ByteArrayOutputStream();
+                    DataOutputStream metaOut = new DataOutputStream(metaStream);
 
                     metaOut.writeUTF(fileName);
-                    metaOut.writeLong(fileSize);
-                    metaOut.write(plaintextHash);
+                    metaOut.writeLong(encryptedSize);
+                    metaOut.write(receivedHash);
 
-                    byte[] dataToVerify =
-                            metaStream.toByteArray();
+                    byte[] dataToVerify = metaStream.toByteArray();
 
-                    DilithiumSigner verifier =
-                            new DilithiumSigner();
+                    DilithiumSigner verifier = new DilithiumSigner();
                     verifier.init(false, clientDilithiumPublic);
 
                     boolean valid =
-                            verifier.verifySignature(
-                                    dataToVerify,
-                                    signature
-                            );
+                            verifier.verifySignature(dataToVerify, signature);
 
                     if (!valid) {
                         System.out.println("❌ SIGNATURE VERIFICATION FAILED!");
@@ -233,6 +193,21 @@ public class MainServer {
                     }
 
                     System.out.println("✅ Dilithium signature verified successfully!");
+
+                    // =========================
+                    // 11. DECRYPT FILE
+                    // =========================
+
+                    byte[] decryptedFile =
+                            AESUtil.decrypt(encryptedFile, serverAESKey, iv);
+
+                    String outputPath = "received_" + fileName;
+
+                    try (FileOutputStream fos = new FileOutputStream(outputPath)) {
+                        fos.write(decryptedFile);
+                    }
+
+                    System.out.println("File decrypted successfully!");
                     System.out.println("SUCCESS: Secure file transfer complete!");
 
                 }
