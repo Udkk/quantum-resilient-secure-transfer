@@ -1,7 +1,10 @@
 import crypto.*;
 
+import javax.crypto.Cipher;
 import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.IvParameterSpec;
+
 import java.io.*;
 import java.net.Socket;
 import java.nio.file.Files;
@@ -14,7 +17,6 @@ import java.security.spec.X509EncodedKeySpec;
 
 import org.bouncycastle.crypto.SecretWithEncapsulation;
 import org.bouncycastle.crypto.AsymmetricCipherKeyPair;
-
 import org.bouncycastle.pqc.crypto.crystals.kyber.*;
 import org.bouncycastle.pqc.crypto.crystals.dilithium.*;
 
@@ -36,188 +38,153 @@ public class MainClient {
             Path filePath = Paths.get(args[0]);
 
             if (!Files.exists(filePath)) {
-                System.out.println("File not found: " + filePath);
+                System.out.println("File not found.");
                 return;
             }
 
             String fileName = filePath.getFileName().toString();
-            byte[] fileBytes = Files.readAllBytes(filePath);
+            long fileSize = Files.size(filePath);
 
             System.out.println("Connecting to server...");
 
-            try (Socket socket = new Socket(host, port)) {
+            try (Socket socket = new Socket(host, port);
+                 DataInputStream dis = new DataInputStream(socket.getInputStream());
+                 DataOutputStream dos = new DataOutputStream(socket.getOutputStream())) {
 
-                DataInputStream dis =
-                        new DataInputStream(socket.getInputStream());
-                DataOutputStream dos =
-                        new DataOutputStream(socket.getOutputStream());
-
-                // ==============================
-                // 1. RECEIVE SERVER PUBLIC KEYS
-                // ==============================
-
-                int serverECDHPubLen = dis.readInt();
-                byte[] serverECDHPubBytes = new byte[serverECDHPubLen];
-                dis.readFully(serverECDHPubBytes);
+                // ===== Receive Server Keys =====
+                int serverECDHLen = dis.readInt();
+                byte[] serverECDHPub = new byte[serverECDHLen];
+                dis.readFully(serverECDHPub);
 
                 KeyFactory kf = KeyFactory.getInstance("EC");
-
                 PublicKey serverECDHPublic =
-                        kf.generatePublic(
-                                new X509EncodedKeySpec(serverECDHPubBytes));
+                        kf.generatePublic(new X509EncodedKeySpec(serverECDHPub));
 
-                int serverKyberPubLen = dis.readInt();
-                byte[] serverKyberPubBytes = new byte[serverKyberPubLen];
-                dis.readFully(serverKyberPubBytes);
+                int serverKyberLen = dis.readInt();
+                byte[] serverKyberPub = new byte[serverKyberLen];
+                dis.readFully(serverKyberPub);
 
                 KyberPublicKeyParameters serverKyberPublic =
                         new KyberPublicKeyParameters(
                                 KyberParameters.kyber512,
-                                serverKyberPubBytes
-                        );
+                                serverKyberPub);
 
-                // ==============================
-                // 2. CLIENT ECDH
-                // ==============================
+                // ===== ECDH =====
+                KeyPair clientECDH = ECDHKeyExchange.generateKeyPair();
 
-                KeyPair clientECDH =
-                        ECDHKeyExchange.generateKeyPair();
-
-                byte[] clientECDHPubBytes =
+                byte[] clientECDHPub =
                         clientECDH.getPublic().getEncoded();
 
-                dos.writeInt(clientECDHPubBytes.length);
-                dos.write(clientECDHPubBytes);
+                dos.writeInt(clientECDHPub.length);
+                dos.write(clientECDHPub);
 
-                byte[] clientECDHSecret =
+                byte[] ecdhSecret =
                         ECDHKeyExchange.computeSharedSecret(
                                 clientECDH.getPrivate(),
-                                serverECDHPublic
-                        );
+                                serverECDHPublic);
 
-                // ==============================
-                // 3. KYBER ENCAPSULATION
-                // ==============================
-
-                SecretWithEncapsulation clientEncap =
+                // ===== Kyber =====
+                SecretWithEncapsulation encap =
                         KyberKeyExchange.encapsulate(serverKyberPublic);
 
-                byte[] kyberEncapsulation =
-                        clientEncap.getEncapsulation();
+                dos.writeInt(encap.getEncapsulation().length);
+                dos.write(encap.getEncapsulation());
 
-                byte[] clientKyberSecret =
-                        clientEncap.getSecret();
+                byte[] kyberSecret = encap.getSecret();
 
-                dos.writeInt(kyberEncapsulation.length);
-                dos.write(kyberEncapsulation);
-
-                // ==============================
-                // 4. DERIVE HYBRID AES KEY
-                // ==============================
-
-                SecretKey clientAESKey =
+                // ===== Hybrid AES Key =====
+                SecretKey aesKey =
                         HybridKeyDerivation.deriveHybridAESKey(
-                                clientECDHSecret,
-                                clientKyberSecret
-                        );
+                                ecdhSecret,
+                                kyberSecret);
 
-                System.out.println("Hybrid AES key derived!");
+                System.out.println("Hybrid AES key derived.");
 
-                // ==============================
-                // 5. GENERATE DILITHIUM KEYPAIR
-                // ==============================
-
-                AsymmetricCipherKeyPair dilithiumKP =
+                // ===== Dilithium =====
+                AsymmetricCipherKeyPair dilKP =
                         DilithiumKeyExchange.generateKeyPair();
 
-                DilithiumPublicKeyParameters dilithiumPublic =
-                        (DilithiumPublicKeyParameters) dilithiumKP.getPublic();
+                DilithiumPublicKeyParameters dilPublic =
+                        (DilithiumPublicKeyParameters) dilKP.getPublic();
 
-                DilithiumPrivateKeyParameters dilithiumPrivate =
-                        (DilithiumPrivateKeyParameters) dilithiumKP.getPrivate();
+                DilithiumPrivateKeyParameters dilPrivate =
+                        (DilithiumPrivateKeyParameters) dilKP.getPrivate();
 
-                byte[] dilithiumPubBytes =
-                        dilithiumPublic.getEncoded();
+                byte[] dilPubBytes = dilPublic.getEncoded();
 
-                // ==============================
-                // 6. GENERATE IV
-                // ==============================
-
-                IvParameterSpec iv =
-                        AESUtil.generateIV();
-
+                // ===== IV =====
+                IvParameterSpec iv = AESUtil.generateIV();
                 byte[] ivBytes = iv.getIV();
 
-                // ==============================
-                // 7. ENCRYPT FILE
-                // ==============================
+                // 🔥 IMPORTANT FIX
+                long encryptedSize = fileSize + 16; // GCM tag
 
-                byte[] encryptedFile =
-                        AESUtil.encrypt(
-                                fileBytes,
-                                clientAESKey,
-                                iv
-                        );
-
-                // ==============================
-                // 8. HASH ENCRYPTED FILE
-                // ==============================
-
-                byte[] encryptedHash =
-                        HashUtil.sha256(encryptedFile);
-
-                // ==============================
-                // 9. BUILD SIGNED METADATA
-                // ==============================
-
-                ByteArrayOutputStream metaStream =
-                        new ByteArrayOutputStream();
-                DataOutputStream metaOut =
-                        new DataOutputStream(metaStream);
+                // ===== Sign metadata =====
+                ByteArrayOutputStream metaStream = new ByteArrayOutputStream();
+                DataOutputStream metaOut = new DataOutputStream(metaStream);
 
                 metaOut.writeUTF(fileName);
-                metaOut.writeLong(encryptedFile.length);
-                metaOut.write(encryptedHash);
+                metaOut.writeLong(encryptedSize);
 
-                byte[] dataToSign =
-                        metaStream.toByteArray();
-
-                DilithiumSigner signer =
-                        new DilithiumSigner();
-
-                signer.init(true, dilithiumPrivate);
+                DilithiumSigner signer = new DilithiumSigner();
+                signer.init(true, dilPrivate);
 
                 byte[] signature =
-                        signer.generateSignature(dataToSign);
+                        signer.generateSignature(metaStream.toByteArray());
 
-                // ==============================
-                // 10. SEND EVERYTHING
-                // ==============================
+                // ===== Send metadata =====
+                dos.writeInt(dilPubBytes.length);
+                dos.write(dilPubBytes);
 
-                // Send Dilithium public key
-                dos.writeInt(dilithiumPubBytes.length);
-                dos.write(dilithiumPubBytes);
-
-                // Send signature
                 dos.writeInt(signature.length);
                 dos.write(signature);
 
-                // Send file metadata
                 dos.writeUTF(fileName);
-
                 dos.writeInt(ivBytes.length);
                 dos.write(ivBytes);
+                dos.writeLong(encryptedSize);
 
-                dos.writeLong(encryptedFile.length);
-                dos.write(encryptedFile);
+                // ===== Streaming Encrypt =====
+                Cipher cipher =
+                        Cipher.getInstance("AES/GCM/NoPadding");
 
-                dos.writeInt(encryptedHash.length);
-                dos.write(encryptedHash);
+                GCMParameterSpec spec =
+                        new GCMParameterSpec(128, ivBytes);
+
+                cipher.init(Cipher.ENCRYPT_MODE, aesKey, spec);
+
+                try (FileInputStream fis =
+                             new FileInputStream(filePath.toFile())) {
+
+                    byte[] buffer = new byte[4096];
+                    int bytesRead;
+
+                    while ((bytesRead = fis.read(buffer)) != -1) {
+
+                        byte[] encryptedChunk =
+                                cipher.update(buffer, 0, bytesRead);
+
+                        if (encryptedChunk != null) {
+                            dos.write(encryptedChunk);
+                        }
+                    }
+
+                    byte[] finalBytes = cipher.doFinal();
+                    if (finalBytes != null) {
+                        dos.write(finalBytes);
+                    }
+                }
 
                 dos.flush();
 
-                System.out.println("SUCCESS: Secure hybrid PQ file sent!");
+                System.out.println("File sent. Waiting for confirmation...");
 
+                boolean success = dis.readBoolean();
+
+                if (success)
+                    System.out.println("✅ Secure transfer complete.");
+                else
+                    System.out.println("❌ Server rejected transfer.");
             }
 
         } catch (Exception e) {

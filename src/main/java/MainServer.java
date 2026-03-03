@@ -1,7 +1,11 @@
 import crypto.*;
 
+import javax.crypto.Cipher;
 import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.AEADBadTagException;
+
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -9,7 +13,6 @@ import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.PublicKey;
 import java.security.spec.X509EncodedKeySpec;
-import java.util.Arrays;
 
 import org.bouncycastle.crypto.AsymmetricCipherKeyPair;
 import org.bouncycastle.pqc.crypto.crystals.kyber.*;
@@ -25,11 +28,8 @@ public class MainServer {
             int port = 5000;
             System.out.println("Server starting on port " + port + "...");
 
-            // =========================
-            // GENERATE SERVER KEYS
-            // =========================
-
-            KeyPair serverECDH = ECDHKeyExchange.generateKeyPair();
+            KeyPair serverECDH =
+                    ECDHKeyExchange.generateKeyPair();
 
             AsymmetricCipherKeyPair serverKyberKP =
                     KyberKeyExchange.generateKyberKeyPair();
@@ -40,176 +40,185 @@ public class MainServer {
             KyberPrivateKeyParameters serverKyberPrivate =
                     (KyberPrivateKeyParameters) serverKyberKP.getPrivate();
 
-            try (ServerSocket serverSocket = new ServerSocket(port)) {
+            try (ServerSocket serverSocket =
+                         new ServerSocket(port)) {
 
                 System.out.println("Waiting for client...");
 
                 try (Socket socket = serverSocket.accept();
-                     DataInputStream dis = new DataInputStream(socket.getInputStream());
-                     DataOutputStream dos = new DataOutputStream(socket.getOutputStream())) {
+                     DataInputStream dis =
+                             new DataInputStream(socket.getInputStream());
+                     DataOutputStream dos =
+                             new DataOutputStream(socket.getOutputStream())) {
 
-                    System.out.println("Client connected!");
+                    System.out.println("Client connected.");
 
-                    // =========================
-                    // 1. SEND SERVER PUBLIC KEYS
-                    // =========================
+                    // ===== Send server keys =====
+                    byte[] serverECDHPub =
+                            serverECDH.getPublic().getEncoded();
 
-                    byte[] serverECDHPubBytes = serverECDH.getPublic().getEncoded();
-                    dos.writeInt(serverECDHPubBytes.length);
-                    dos.write(serverECDHPubBytes);
+                    dos.writeInt(serverECDHPub.length);
+                    dos.write(serverECDHPub);
 
-                    byte[] serverKyberPubBytes = serverKyberPublic.getEncoded();
-                    dos.writeInt(serverKyberPubBytes.length);
-                    dos.write(serverKyberPubBytes);
+                    byte[] serverKyberPub =
+                            serverKyberPublic.getEncoded();
+
+                    dos.writeInt(serverKyberPub.length);
+                    dos.write(serverKyberPub);
                     dos.flush();
 
-                    // =========================
-                    // 2. RECEIVE CLIENT ECDH PUBLIC KEY
-                    // =========================
+                    // ===== Receive client ECDH =====
+                    int clientECDHLen = dis.readInt();
+                    byte[] clientECDHPub =
+                            new byte[clientECDHLen];
+                    dis.readFully(clientECDHPub);
 
-                    int clientECDHPubLen = dis.readInt();
-                    byte[] clientECDHPubBytes = new byte[clientECDHPubLen];
-                    dis.readFully(clientECDHPubBytes);
+                    KeyFactory kf =
+                            KeyFactory.getInstance("EC");
 
-                    KeyFactory kf = KeyFactory.getInstance("EC");
                     PublicKey clientECDHPublic =
-                            kf.generatePublic(new X509EncodedKeySpec(clientECDHPubBytes));
+                            kf.generatePublic(
+                                    new X509EncodedKeySpec(clientECDHPub));
 
-                    byte[] serverECDHSecret =
+                    byte[] ecdhSecret =
                             ECDHKeyExchange.computeSharedSecret(
                                     serverECDH.getPrivate(),
-                                    clientECDHPublic
-                            );
+                                    clientECDHPublic);
 
-                    // =========================
-                    // 3. RECEIVE KYBER ENCAPSULATION
-                    // =========================
-
+                    // ===== Receive Kyber encapsulation =====
                     int encapLen = dis.readInt();
-                    byte[] kyberEncapsulation = new byte[encapLen];
-                    dis.readFully(kyberEncapsulation);
+                    byte[] encapsulation =
+                            new byte[encapLen];
+                    dis.readFully(encapsulation);
 
-                    byte[] serverKyberSecret =
+                    byte[] kyberSecret =
                             KyberKeyExchange.decapsulate(
                                     serverKyberPrivate,
-                                    kyberEncapsulation
-                            );
+                                    encapsulation);
 
-                    // =========================
-                    // 4. DERIVE HYBRID AES KEY
-                    // =========================
-
-                    SecretKey serverAESKey =
+                    SecretKey aesKey =
                             HybridKeyDerivation.deriveHybridAESKey(
-                                    serverECDHSecret,
-                                    serverKyberSecret
-                            );
+                                    ecdhSecret,
+                                    kyberSecret);
 
-                    System.out.println("Hybrid AES key derived successfully!");
+                    System.out.println("Hybrid AES key derived.");
 
-                    // =========================
-                    // 5. RECEIVE DILITHIUM PUBLIC KEY
-                    // =========================
+                    // ===== Receive Dilithium pub =====
+                    int dilLen = dis.readInt();
+                    byte[] dilPubBytes =
+                            new byte[dilLen];
+                    dis.readFully(dilPubBytes);
 
-                    int dilithiumPubLen = dis.readInt();
-                    byte[] dilithiumPubBytes = new byte[dilithiumPubLen];
-                    dis.readFully(dilithiumPubBytes);
-
-                    DilithiumPublicKeyParameters clientDilithiumPublic =
+                    DilithiumPublicKeyParameters clientDilPublic =
                             new DilithiumPublicKeyParameters(
                                     DilithiumParameters.dilithium3,
-                                    dilithiumPubBytes
-                            );
+                                    dilPubBytes);
 
-                    // =========================
-                    // 6. RECEIVE SIGNATURE
-                    // =========================
-
+                    // ===== Signature =====
                     int sigLen = dis.readInt();
-                    byte[] signature = new byte[sigLen];
+                    byte[] signature =
+                            new byte[sigLen];
                     dis.readFully(signature);
 
-                    // =========================
-                    // 7. RECEIVE FILE METADATA
-                    // =========================
-
+                    // ===== Metadata =====
                     String fileName = dis.readUTF();
-                    System.out.println("Receiving file: " + fileName);
 
-                    int ivLength = dis.readInt();
-                    byte[] ivBytes = new byte[ivLength];
+                    int ivLen = dis.readInt();
+                    byte[] ivBytes =
+                            new byte[ivLen];
                     dis.readFully(ivBytes);
-                    IvParameterSpec iv = new IvParameterSpec(ivBytes);
 
-                    long encryptedSize = dis.readLong();
-                    System.out.println("Encrypted file size: " + encryptedSize);
+                    IvParameterSpec iv =
+                            new IvParameterSpec(ivBytes);
 
-                    // =========================
-                    // 8. RECEIVE ENCRYPTED FILE
-                    // =========================
+                    long encryptedSize =
+                            dis.readLong();
 
-                    byte[] encryptedFile = new byte[(int) encryptedSize];
-                    dis.readFully(encryptedFile);
+                    System.out.println("Receiving: " + fileName);
+                    System.out.println("Encrypted size: " + encryptedSize);
 
-                    // =========================
-                    // 9. RECEIVE HASH
-                    // =========================
-
-                    int hashLen = dis.readInt();
-                    byte[] receivedHash = new byte[hashLen];
-                    dis.readFully(receivedHash);
-
-                    byte[] computedHash = HashUtil.sha256(encryptedFile);
-
-                    if (!Arrays.equals(receivedHash, computedHash)) {
-                        System.out.println("❌ ERROR: Encrypted file hash mismatch!");
-                        return;
-                    }
-
-                    System.out.println("Encrypted file hash verified!");
-
-                    // =========================
-                    // 10. VERIFY SIGNATURE (Before Decrypt)
-                    // =========================
-
-                    ByteArrayOutputStream metaStream = new ByteArrayOutputStream();
-                    DataOutputStream metaOut = new DataOutputStream(metaStream);
+                    // ===== Verify Signature =====
+                    ByteArrayOutputStream metaStream =
+                            new ByteArrayOutputStream();
+                    DataOutputStream metaOut =
+                            new DataOutputStream(metaStream);
 
                     metaOut.writeUTF(fileName);
                     metaOut.writeLong(encryptedSize);
-                    metaOut.write(receivedHash);
 
-                    byte[] dataToVerify = metaStream.toByteArray();
+                    DilithiumSigner verifier =
+                            new DilithiumSigner();
+                    verifier.init(false, clientDilPublic);
 
-                    DilithiumSigner verifier = new DilithiumSigner();
-                    verifier.init(false, clientDilithiumPublic);
+                    if (!verifier.verifySignature(
+                            metaStream.toByteArray(),
+                            signature)) {
 
-                    boolean valid =
-                            verifier.verifySignature(dataToVerify, signature);
-
-                    if (!valid) {
-                        System.out.println("❌ SIGNATURE VERIFICATION FAILED!");
+                        System.out.println("❌ Signature invalid.");
+                        dos.writeBoolean(false);
+                        dos.flush();
                         return;
                     }
 
-                    System.out.println("✅ Dilithium signature verified successfully!");
+                    System.out.println("✅ Signature verified.");
 
-                    // =========================
-                    // 11. DECRYPT FILE
-                    // =========================
+                    // ===== Streaming Decrypt =====
+                    Cipher cipher =
+                            Cipher.getInstance("AES/GCM/NoPadding");
 
-                    byte[] decryptedFile =
-                            AESUtil.decrypt(encryptedFile, serverAESKey, iv);
+                    GCMParameterSpec spec =
+                            new GCMParameterSpec(128, ivBytes);
 
-                    String outputPath = "received_" + fileName;
+                    cipher.init(Cipher.DECRYPT_MODE,
+                            aesKey,
+                            spec);
 
-                    try (FileOutputStream fos = new FileOutputStream(outputPath)) {
-                        fos.write(decryptedFile);
+                    String outputPath =
+                            "received_" + fileName;
+
+                    try (FileOutputStream fos =
+                                 new FileOutputStream(outputPath)) {
+
+                        byte[] buffer = new byte[4096];
+                        long totalRead = 0;
+
+                        while (totalRead < encryptedSize) {
+
+                            int toRead =
+                                    (int)Math.min(buffer.length,
+                                            encryptedSize - totalRead);
+
+                            int bytesRead =
+                                    dis.read(buffer, 0, toRead);
+
+                            if (bytesRead == -1)
+                                break;
+
+                            totalRead += bytesRead;
+
+                            byte[] decryptedChunk =
+                                    cipher.update(buffer, 0, bytesRead);
+
+                            if (decryptedChunk != null)
+                                fos.write(decryptedChunk);
+                        }
+
+                        byte[] finalBytes =
+                                cipher.doFinal();
+
+                        if (finalBytes != null)
+                            fos.write(finalBytes);
+
+                        System.out.println("✅ File decrypted.");
+                        dos.writeBoolean(true);
+                        dos.flush();
+
+                    } catch (AEADBadTagException e) {
+
+                        System.out.println("❌ GCM tag verification failed.");
+                        dos.writeBoolean(false);
+                        dos.flush();
                     }
-
-                    System.out.println("File decrypted successfully!");
-                    System.out.println("SUCCESS: Secure file transfer complete!");
-
                 }
             }
 
