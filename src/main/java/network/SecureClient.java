@@ -1,20 +1,27 @@
 package network;
 
+import crypto.*;
+
 import javax.crypto.Cipher;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
-import javax.crypto.spec.SecretKeySpec;
+import javax.crypto.spec.IvParameterSpec;
+
 import java.io.*;
 import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.SecureRandom;
+import java.security.KeyFactory;
+import java.security.KeyPair;
+import java.security.PublicKey;
+import java.security.spec.X509EncodedKeySpec;
+
+import org.bouncycastle.crypto.SecretWithEncapsulation;
+import org.bouncycastle.crypto.AsymmetricCipherKeyPair;
+import org.bouncycastle.pqc.crypto.crystals.kyber.*;
+import org.bouncycastle.pqc.crypto.crystals.dilithium.*;
 
 public class SecureClient {
-
-    private static final int AES_KEY_SIZE = 32; // 256-bit
-    private static final int GCM_IV_LENGTH = 12;
-    private static final int GCM_TAG_LENGTH = 128;
 
     public static boolean sendFile(
             String host,
@@ -22,71 +29,168 @@ public class SecureClient {
             Path filePath,
             ProgressCallback callback) {
 
-        try (Socket socket = new Socket(host, port);
-             DataOutputStream dos = new DataOutputStream(socket.getOutputStream());
-             FileInputStream fis = new FileInputStream(filePath.toFile())) {
+        try {
+            CryptoProvider.register();
 
-            callback.onLog("Connected to server.");
+            if (!Files.exists(filePath)) {
+                callback.onLog("File not found.");
+                return false;
+            }
 
-            long fileSize = Files.size(filePath);
             String fileName = filePath.getFileName().toString();
+            long fileSize = Files.size(filePath);
 
-            // 🔐 Generate AES key
-            byte[] keyBytes = new byte[AES_KEY_SIZE];
-            new SecureRandom().nextBytes(keyBytes);
-            SecretKey aesKey = new SecretKeySpec(keyBytes, "AES");
+            callback.onLog("Connecting to server...");
 
-            // 🔐 Generate IV
-            byte[] iv = new byte[GCM_IV_LENGTH];
-            new SecureRandom().nextBytes(iv);
+            try (Socket socket = new Socket(host, port);
+                 DataInputStream dis = new DataInputStream(socket.getInputStream());
+                 DataOutputStream dos = new DataOutputStream(socket.getOutputStream())) {
 
-            // Send metadata first
-            dos.writeUTF(fileName);
-            dos.writeLong(fileSize);
-            dos.writeInt(iv.length);
-            dos.write(iv);
-            dos.writeInt(keyBytes.length);
-            dos.write(keyBytes);
+                // ===== RECEIVE SERVER KEYS =====
+                int serverECDHLen = dis.readInt();
+                byte[] serverECDHPub = new byte[serverECDHLen];
+                dis.readFully(serverECDHPub);
 
-            callback.onLog("Metadata sent. Starting encryption...");
+                PublicKey serverECDHPublic =
+                        KeyFactory.getInstance("EC")
+                                .generatePublic(new X509EncodedKeySpec(serverECDHPub));
 
-            // 🔐 Initialize AES-GCM
-            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-            GCMParameterSpec spec = new GCMParameterSpec(GCM_TAG_LENGTH, iv);
-            cipher.init(Cipher.ENCRYPT_MODE, aesKey, spec);
+                int serverKyberLen = dis.readInt();
+                byte[] serverKyberPub = new byte[serverKyberLen];
+                dis.readFully(serverKyberPub);
 
-            byte[] buffer = new byte[4096];
-            int bytesRead;
-            long totalSent = 0;
+                KyberPublicKeyParameters serverKyberPublic =
+                        new KyberPublicKeyParameters(
+                                KyberParameters.kyber512,
+                                serverKyberPub);
 
-            while ((bytesRead = fis.read(buffer)) != -1) {
+                // ===== ECDH =====
+                KeyPair clientECDH = ECDHKeyExchange.generateKeyPair();
+                byte[] clientECDHPub = clientECDH.getPublic().getEncoded();
 
-                byte[] encrypted = cipher.update(buffer, 0, bytesRead);
-                if (encrypted != null) {
-                    dos.write(encrypted);
+                dos.writeInt(clientECDHPub.length);
+                dos.write(clientECDHPub);
+
+                byte[] ecdhSecret =
+                        ECDHKeyExchange.computeSharedSecret(
+                                clientECDH.getPrivate(),
+                                serverECDHPublic);
+
+                // ===== KYBER =====
+                SecretWithEncapsulation encap =
+                        KyberKeyExchange.encapsulate(serverKyberPublic);
+
+                dos.writeInt(encap.getEncapsulation().length);
+                dos.write(encap.getEncapsulation());
+
+                byte[] kyberSecret = encap.getSecret();
+
+                // ===== HYBRID KEY DERIVATION =====
+                SecretKey aesKey =
+                        HybridKeyDerivation.deriveHybridAESKey(
+                                ecdhSecret,
+                                kyberSecret);
+
+                callback.onLog("Hybrid AES key derived.");
+
+                // ===== DILITHIUM SIGNATURE =====
+                AsymmetricCipherKeyPair dilKP =
+                        DilithiumKeyExchange.generateKeyPair();
+
+                DilithiumPublicKeyParameters dilPublic =
+                        (DilithiumPublicKeyParameters) dilKP.getPublic();
+
+                DilithiumPrivateKeyParameters dilPrivate =
+                        (DilithiumPrivateKeyParameters) dilKP.getPrivate();
+
+                byte[] dilPubBytes = dilPublic.getEncoded();
+
+                // ===== IV =====
+                IvParameterSpec iv = AESUtil.generateIV();
+                byte[] ivBytes = iv.getIV();
+
+                long encryptedSize = fileSize + 16; // GCM tag
+
+                // ===== SIGN METADATA =====
+                ByteArrayOutputStream metaStream = new ByteArrayOutputStream();
+                DataOutputStream metaOut = new DataOutputStream(metaStream);
+
+                metaOut.writeUTF(fileName);
+                metaOut.writeLong(encryptedSize);
+
+                DilithiumSigner signer = new DilithiumSigner();
+                signer.init(true, dilPrivate);
+
+                byte[] signature =
+                        signer.generateSignature(metaStream.toByteArray());
+
+
+                // ===== SEND METADATA =====
+                dos.writeInt(dilPubBytes.length);
+                dos.write(dilPubBytes);
+
+                dos.writeInt(signature.length);
+                dos.write(signature);
+
+                dos.writeUTF(fileName);
+                dos.writeInt(ivBytes.length);
+                dos.write(ivBytes);
+                dos.writeLong(encryptedSize);
+
+                // ===== STREAMING ENCRYPTION =====
+                Cipher cipher =
+                        Cipher.getInstance("AES/GCM/NoPadding");
+
+                GCMParameterSpec spec =
+                        new GCMParameterSpec(128, ivBytes);
+
+                cipher.init(Cipher.ENCRYPT_MODE, aesKey, spec);
+
+                try (InputStream fis = Files.newInputStream(filePath)) {
+
+                    byte[] buffer = new byte[4096];
+                    int bytesRead;
+                    long totalSent = 0;
+
+                    while ((bytesRead = fis.read(buffer)) != -1) {
+
+                        byte[] encryptedChunk =
+                                cipher.update(buffer, 0, bytesRead);
+
+                        if (encryptedChunk != null) {
+                            dos.write(encryptedChunk);
+                            totalSent += encryptedChunk.length;
+
+                            double progress =
+                                    (double) totalSent / encryptedSize;
+
+                            callback.onProgress(progress);
+                        }
+                    }
+
+                    byte[] finalBytes = cipher.doFinal();
+                    if (finalBytes != null) {
+                        dos.write(finalBytes);
+                    }
                 }
 
-                totalSent += bytesRead;
-                double progress = (double) totalSent / fileSize;
-                callback.onProgress(progress);
+                dos.flush();
+
+                callback.onLog("File sent. Waiting for confirmation...");
+
+                boolean success = dis.readBoolean();
+
+                if (success)
+                    callback.onLog("Secure transfer complete.");
+                else
+                    callback.onLog("Server rejected transfer.");
+
             }
-
-            // Final block (includes GCM tag)
-            byte[] finalBlock = cipher.doFinal();
-            if (finalBlock != null) {
-                dos.write(finalBlock);
-            }
-
-            dos.flush();
-
-            callback.onLog("Encryption complete.");
-            callback.onLog("File transfer finished.");
-
-            return true;
 
         } catch (Exception e) {
-            callback.onLog("Error: " + e.getMessage());
-            return false;
+            callback.onLog("Client error: " + e.getMessage());
+
         }
+        return true;
     }
 }

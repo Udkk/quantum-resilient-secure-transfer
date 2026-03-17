@@ -1,0 +1,76 @@
+.root {
+    -fx-background-color: #0f172a;
+    -fx-font-family: "Segoe UI", "Inter", "Roboto";
+}
+
+.card {
+    -fx-background-color: #1e293b;
+    -fx-background-radius: 16;
+    -fx-padding: 25;
+    -fx-effect: dropshadow(gaussian, rgba(0,0,0,0.4), 25, 0.3, 0, 10);
+}
+
+.label-title {
+    -fx-text-fill: #e2e8f0;
+    -fx-font-size: 20px;
+    -fx-font-weight: bold;
+}
+
+.label {
+    -fx-text-fill: #cbd5e1;
+}
+
+.text-field {
+    -fx-background-color: #334155;
+    -fx-text-fill: white;
+    -fx-background-radius: 8;
+}
+
+.button {
+    -fx-background-color: linear-gradient(to right, #3b82f6, #6366f1);
+    -fx-text-fill: white;
+    -fx-font-weight: bold;
+    -fx-background-radius: 8;
+    -fx-cursor: hand;
+}
+
+.button:hover {
+    -fx-background-color: linear-gradient(to right, #2563eb, #4f46e5);
+}
+
+.progress-bar {
+    -fx-accent: #22d3ee;
+}
+
+.text-area {
+    -fx-background-color: #0f172a;
+    -fx-control-inner-background: #0f172a;
+    -fx-text-fill: #94a3b8;
+    -fx-border-color: #1e293b;
+}
+.status-badge {
+    -fx-padding: 4 12 4 12;
+    -fx-background-radius: 20;
+    -fx-font-weight: bold;
+    -fx-text-fill: white;
+}
+
+.status-idle {
+    -fx-background-color: #64748b;
+}
+
+.status-connected {
+    -fx-background-color: #16a34a;
+}
+
+.status-transferring {
+    -fx-background-color: #f59e0b;
+}
+
+.status-failed {
+    -fx-background-color: #dc2626;
+}
+
+.progress-glow {
+    -fx-effect: dropshadow(gaussian, #22d3ee, 20, 0.6, 0, 0);
+}
